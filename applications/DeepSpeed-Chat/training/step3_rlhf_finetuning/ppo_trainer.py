@@ -9,18 +9,18 @@ import os
 import time
 import deepspeed
 from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
-from deepspeed.accelerator import get_accelerator
 
-sys.path.append(
+sys.path.insert(0,
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 
 from utils.utils import print_rank_0
-
+from utils.accelerator_utils import hpu_mark_step, is_hpu
 
 def print_all_ranks(tag, value, rank):
     world_size = torch.distributed.get_world_size()
-    all_tensor = torch.zeros(world_size, dtype=torch.float32).to(
-        get_accelerator().current_device_name())
+    all_tensor = torch.zeros(world_size,
+                             dtype=torch.float32,
+                             device=value.device)
     all_tensor[rank] = value
     torch.distributed.all_reduce(all_tensor, op=torch.distributed.ReduceOp.SUM)
     print_rank_0(f'{tag} {all_tensor}', rank)
@@ -62,6 +62,11 @@ class DeepSpeedPPOTrainer():
         self.z3_enabled = args.actor_zero_stage == 3
         self.compute_fp32_loss = self.args.compute_fp32_loss
 
+        # In case the generated experience is not valid (too short), we use the last valid
+        # generated experience. Alternatively, we can skip the step (on all workers).
+        # For now, use the last valid experience which is a simpler solution
+        self.last_generated_experience = None
+
         # Those value can be changed
         self.kl_ctl = 0.1
         self.clip_reward_value = 5
@@ -70,6 +75,8 @@ class DeepSpeedPPOTrainer():
         self.gamma = 1.0
         self.lam = 0.95
         self.generate_time = 0.0
+        self.first_generate = True
+        self.actor_model_hpu_graph_wrapped_fwd_fn = None
 
     def _generate_sequence(self, prompts, mask, step):
 
@@ -84,13 +91,38 @@ class DeepSpeedPPOTrainer():
             kwargs = dict()
 
         with torch.no_grad():
-            seq = self.actor_model.module.generate(
-                prompts,
-                attention_mask=mask,
-                max_length=max_min_length,
-                pad_token_id=self.tokenizer.pad_token_id,
-                synced_gpus=self.z3_enabled,
-                **kwargs)
+            if is_hpu():
+                import habana_frameworks.torch.hpu as thpu
+            if is_hpu():
+                if self.args.enable_hpu_graphs:
+                    orig_actor_model_fwd_fn = self.actor_model.module._call_impl
+                    if self.first_generate:
+                        self.actor_model.module._call_impl = thpu.wrap_in_hpu_graph_func(self.actor_model.module._call_impl)
+                        self.first_generate = False
+                    else:
+                        self.actor_model.module._call_impl = self.actor_model_hpu_graph_wrapped_fwd_fn
+                # TODO (SW-163228) Re-enable cache (use_cache=True) once the non-static shapes issue is solved.
+                # The cache is still enabled when hybrid engine is disabled to preserve the performance.
+                use_cache = not self.args.enable_hybrid_engine
+                seq = self.actor_model.module.generate(prompts,
+                                                    attention_mask=mask,
+                                                    max_new_tokens=max_min_length-prompts.shape[1],
+                                                    pad_token_id=self.tokenizer.pad_token_id,
+                                                    lazy_mode=True,
+                                                    ignore_eos=False,
+                                                    use_cache=use_cache,
+                                                    synced_gpus=self.z3_enabled)
+                if self.args.enable_hpu_graphs:
+                    self.actor_model_hpu_graph_wrapped_fwd_fn = self.actor_model.module._call_impl
+                    self.actor_model.module._call_impl = orig_actor_model_fwd_fn
+            else:
+                seq = self.actor_model.module.generate(
+                    prompts,
+                    attention_mask=mask,
+                    max_length=max_min_length,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    synced_gpus=self.z3_enabled,
+                    **kwargs)
 
         # Filter out seq with no answers (or very short). This happens when users directly use the pre-training ckpt without supervised finetuning
         # NOTE: this will causes each GPU has different number of examples
@@ -100,7 +132,8 @@ class DeepSpeedPPOTrainer():
         ans = seq[:, prompt_length:]
         valid_ans_len = (ans != self.tokenizer.pad_token_id).sum(dim=-1)
 
-        if self.args.print_answers:
+        if self.args.print_answers and (step % self.args.print_answers_interval
+                                        == 0):
             print(
                 f"--- prompt --> step={step}, rank={torch.distributed.get_rank()}, {self.tokenizer.batch_decode(prompts, skip_special_tokens=True)}"
             )
@@ -112,10 +145,24 @@ class DeepSpeedPPOTrainer():
         for i in range(batch_size):
             if valid_ans_len[
                     i] <= 1:  # if the answer is shorter than 1 token, drop it
+                print(
+                    f'Dropping too short generated answer: {step=}: \n'
+                    f'prompts: {self.tokenizer.batch_decode(prompts, skip_special_tokens=False)}\n'
+                    f'answers: {self.tokenizer.batch_decode(ans, skip_special_tokens=False)}'
+                )
                 continue
             else:
                 out_seq.append(seq[i:i + 1])
-        out_seq = torch.cat(out_seq, dim=0)  # concate output in the batch dim
+
+        if not out_seq:
+            print(
+                f'All generated results are too short for rank={self.args.local_rank} step={step}\n'
+                f'-> prompts: {self.tokenizer.batch_decode(prompts, skip_special_tokens=False)}\n'
+                f'-> answers: {self.tokenizer.batch_decode(ans, skip_special_tokens=False)}'
+            )
+            return None
+
+        out_seq = torch.cat(out_seq, dim=0)  # concat output in the batch dim
 
         return out_seq
 
@@ -124,19 +171,31 @@ class DeepSpeedPPOTrainer():
         generate_start = time.time()
         seq = self._generate_sequence(prompts, mask, step)
         generate_end = time.time()
+        if seq is None:
+            assert self.last_generated_experience is not None, f'Invalid generated experience at {step=}'
+            prompts = self.last_generated_experience['prompts']
+            seq = self.last_generated_experience['seq']
+        else:
+            self.last_generated_experience = {'prompts': prompts, 'seq': seq}
         self.train()
 
         pad_token_id = self.tokenizer.pad_token_id
         attention_mask = seq.not_equal(pad_token_id).long()
+
+        hpu_mark_step()
         with torch.no_grad():
             output = self.actor_model(seq, attention_mask=attention_mask)
+            hpu_mark_step()
             output_ref = self.ref_model(seq, attention_mask=attention_mask)
+            hpu_mark_step()
             reward_score = self.reward_model.forward_value(
                 seq, attention_mask,
                 prompt_length=self.prompt_length)['chosen_end_scores'].detach(
                 )
+            hpu_mark_step()
             values = self.critic_model.forward_value(
                 seq, attention_mask, return_value_only=True).detach()[:, :-1]
+            hpu_mark_step()
 
         logits = output.logits
         logits_ref = output_ref.logits
@@ -200,25 +259,34 @@ class DeepSpeedPPOTrainer():
             advantages, returns = self.get_advantages_and_returns(
                 old_values, old_rewards, start)
 
+        hpu_mark_step()
         ### process the new outputs
         batch = {'input_ids': seq, "attention_mask": attention_mask}
         actor_prob = self.actor_model(**batch, use_cache=False).logits
+        hpu_mark_step()
         actor_log_prob = gather_log_probs(actor_prob[:, :-1, :], seq[:, 1:])
+        hpu_mark_step()
         actor_loss = self.actor_loss_fn(actor_log_prob[:, start:],
                                         log_probs[:, start:], advantages,
                                         action_mask[:, start:])
+        hpu_mark_step()
         self.actor_model.backward(actor_loss)
+        hpu_mark_step()
 
         if not self.args.align_overflow:
             self.actor_model.step()
+            hpu_mark_step()
 
         value = self.critic_model.forward_value(**batch,
                                                 return_value_only=True,
                                                 use_cache=False)[:, :-1]
+        hpu_mark_step()
         critic_loss = self.critic_loss_fn(value[:, start:], old_values[:,
                                                                        start:],
                                           returns, action_mask[:, start:])
+        hpu_mark_step()
         self.critic_model.backward(critic_loss)
+        hpu_mark_step()
 
         if self.args.align_overflow:
             actor_overflow = self.actor_model.optimizer.check_overflow(
@@ -242,8 +310,10 @@ class DeepSpeedPPOTrainer():
                     "OVERFLOW: actor and critic overflow, skipping both actor and critic steps",
                     rank)
             self.actor_model.step()
+            hpu_mark_step()
 
         self.critic_model.step()
+        hpu_mark_step()
 
         return actor_loss, critic_loss
 

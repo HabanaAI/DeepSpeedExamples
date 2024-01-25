@@ -1,3 +1,4 @@
+# Copyright (c) 2023 Habana Labs, Ltd. an Intel Company
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -11,7 +12,7 @@ import os
 from transformers import (
     AutoModelForCausalLM, )
 
-sys.path.append(
+sys.path.insert(0,
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 from utils.model.model_utils import create_hf_model
 from utils.utils import load_hf_tokenizer
@@ -74,6 +75,10 @@ def parse_args():
                         type=str,
                         default="English",
                         choices=["English", "Chinese", "Japanese"])
+    parser.add_argument(
+        "--add_eot_token",
+        action='store_true',
+        help="Add <|endoftext|> as additional special token to tokenizer")
 
     args = parser.parse_args()
 
@@ -197,8 +202,11 @@ def main():
 
     device = torch.device(get_accelerator().device_name(0))
 
+    args.end_of_conversation_token = "<|endoftext|>"
+    additional_special_tokens = args.end_of_conversation_token if args.add_eot_token else None
     tokenizer = load_hf_tokenizer(args.model_name_or_path_baseline,
-                                  fast_tokenizer=True)
+                                  fast_tokenizer=True,
+                                  add_special_tokens=additional_special_tokens)
 
     model_baseline = create_hf_model(AutoModelForCausalLM,
                                      args.model_name_or_path_baseline,

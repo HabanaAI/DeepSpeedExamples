@@ -30,6 +30,7 @@ repos:
     hooks:
     -   id: check-license
         name: check-license
+        exclude: applications/DeepSpeed-Chat/internal/
         entry: ./scripts/check-license.py
         language: script
         files: ^applications/DeepSpeed-Chat/.+\.(py|c|cpp|cu|cc|h|hpp|cuh|hip|tr|sh)$

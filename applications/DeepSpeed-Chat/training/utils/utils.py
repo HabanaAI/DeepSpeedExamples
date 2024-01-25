@@ -1,3 +1,4 @@
+# Copyright (c) 2023 Habana Labs, Ltd. an Intel Company
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -6,6 +7,7 @@ import os
 import torch
 import random
 import numpy as np
+from datetime import datetime
 from transformers import set_seed, AutoTokenizer
 import json
 import deepspeed
@@ -57,6 +59,21 @@ class MovingAverage:
         return self.mean
 
 
+class ExponentialMovingAverage:
+
+    def __init__(self, alpha=0.9):
+        self.alpha = alpha
+        self.ema = None
+
+    def update(self, num):
+        prev_ema = num if self.ema is None else self.ema
+        self.ema = self.alpha * prev_ema + (1.0 - self.alpha) * num
+        return self.ema
+
+    def get(self):
+        return self.ema if self.ema is not None else 0.
+
+
 def get_tokenizer(model_name_or_path, fast_tokenizer=True):
     if "llama" in model_name_or_path:
         from transformers.models.llama import LlamaTokenizer
@@ -76,7 +93,9 @@ def get_tokenizer(model_name_or_path, fast_tokenizer=True):
     return tokenizer
 
 
-def load_hf_tokenizer(model_name_or_path, fast_tokenizer=True):
+def load_hf_tokenizer(model_name_or_path,
+                      fast_tokenizer=True,
+                      add_special_tokens=None):
     if os.path.exists(model_name_or_path):
         # Locally tokenizer loading has some issue, so we need to force download
         model_json = os.path.join(model_name_or_path, "config.json")
@@ -90,25 +109,13 @@ def load_hf_tokenizer(model_name_or_path, fast_tokenizer=True):
         tokenizer = get_tokenizer(model_name_or_path,
                                   fast_tokenizer=fast_tokenizer)
 
+    if add_special_tokens is not None:
+        add_special_tokens = [add_special_tokens] if isinstance(add_special_tokens, str) \
+            else add_special_tokens
+        tokenizer.add_special_tokens(
+            {'additional_special_tokens': add_special_tokens})
+
     return tokenizer
-
-
-def save_hf_format(model, tokenizer, args, sub_folder=""):
-    # used to save huggingface format, so we can use it for hf.from_pretrained
-    model_to_save = model.module if hasattr(model, 'module') else model
-    CONFIG_NAME = "config.json"
-    WEIGHTS_NAME = "pytorch_model.bin"
-    output_dir = os.path.join(args.output_dir, sub_folder)
-    os.makedirs(output_dir, exist_ok=True)
-    output_model_file = os.path.join(output_dir, WEIGHTS_NAME)
-    output_config_file = os.path.join(output_dir, CONFIG_NAME)
-    save_dict = model_to_save.state_dict()
-    for key in list(save_dict.keys()):
-        if "lora" in key:
-            del save_dict[key]
-    torch.save(save_dict, output_model_file)
-    model_to_save.config.to_json_file(output_config_file)
-    tokenizer.save_vocabulary(output_dir)
 
 
 def set_random_seed(seed):
@@ -187,15 +194,18 @@ def get_optimizer_grouped_parameters(
     model,
     weight_decay,
     lora_lr=5e-4,
-    no_decay_name_list=["bias", "LayerNorm.weight"],
+    no_decay_name_list=[
+        "bias", "layer_norm.weight", "layernorm.weight", "norm.weight",
+        "ln_f.weight"
+    ],
     lora_name_list=["lora_right_weight", "lora_left_weight"],
 ):
     optimizer_grouped_parameters = [
         {
             "params": [
                 p for n, p in model.named_parameters()
-                if (not any(nd in n for nd in no_decay_name_list)
-                    and p.requires_grad and not any(nd in n
+                if (not any(nd in n.lower() for nd in no_decay_name_list)
+                    and p.requires_grad and not any(nd in n.lower()
                                                     for nd in lora_name_list))
             ],
             "weight_decay":
@@ -204,8 +214,8 @@ def get_optimizer_grouped_parameters(
         {
             "params": [
                 p for n, p in model.named_parameters()
-                if (not any(nd in n for nd in no_decay_name_list)
-                    and p.requires_grad and any(nd in n
+                if (not any(nd in n.lower() for nd in no_decay_name_list)
+                    and p.requires_grad and any(nd in n.lower()
                                                 for nd in lora_name_list))
             ],
             "weight_decay":
@@ -216,7 +226,7 @@ def get_optimizer_grouped_parameters(
         {
             "params": [
                 p for n, p in model.named_parameters()
-                if (any(nd in n
+                if (any(nd in n.lower()
                         for nd in no_decay_name_list) and p.requires_grad)
             ],
             "weight_decay":
@@ -254,26 +264,23 @@ def moving_average(model, model_ema, beta=0.992, device=None, zero_stage=0):
                     data = data.to(device)
                 param_ema.data.copy_(torch.lerp(data, param_ema.data, beta))
 
-
-def save_zero_three_model(model_ema, global_rank, save_dir, zero_stage=0):
-    zero_stage_3 = (zero_stage == 3)
-    os.makedirs(save_dir, exist_ok=True)
+def save_hf_format(model, tokenizer, args, global_rank=0, zero_stage=0, sub_folder=""):
+    # used to save huggingface format, so we can use it for hf.from_pretrained
+    model_to_save = model.module if hasattr(model, 'module') else model
+    CONFIG_NAME = "config.json"
     WEIGHTS_NAME = "pytorch_model.bin"
-    output_model_file = os.path.join(save_dir, WEIGHTS_NAME)
+    output_dir = os.path.join(args.output_dir, sub_folder)
+    os.makedirs(output_dir, exist_ok=True)
+    output_model_file = os.path.join(output_dir, WEIGHTS_NAME)
+    output_config_file = os.path.join(output_dir, CONFIG_NAME)
 
-    model_to_save = model_ema.module if hasattr(model_ema,
-                                                'module') else model_ema
-    if not zero_stage_3:
-        if global_rank == 0:
-            torch.save(model_to_save.state_dict(), output_model_file)
-    else:
+    if zero_stage == 3:
         output_state_dict = {}
         for k, v in model_to_save.named_parameters():
-
             if hasattr(v, 'ds_id'):
                 with deepspeed.zero.GatheredParameters(_z3_params_to_fetch([v
                                                                             ]),
-                                                       enabled=zero_stage_3):
+                                                       enabled=True):
                     v_p = v.data.cpu()
             else:
                 v_p = v.cpu()
@@ -282,3 +289,33 @@ def save_zero_three_model(model_ema, global_rank, save_dir, zero_stage=0):
         if global_rank == 0:
             torch.save(output_state_dict, output_model_file)
         del output_state_dict
+
+    if global_rank == 0:
+        #TODO: SW-163856 Remove when SW-163747 is fixed
+        model_to_save.to('cpu')
+
+        save_dict = model_to_save.state_dict()
+        for key in list(save_dict.keys()):
+            if "lora" in key:
+                del save_dict[key]
+
+        if zero_stage != 3:
+            torch.save(save_dict, output_model_file)
+        model_to_save.config.to_json_file(output_config_file)
+        tokenizer.save_vocabulary(output_dir)
+
+def print_loss(epoch, step, steps_per_print, gas, loss, loss_sum, rank):
+    step_ = step + 1
+    loss_ = loss.detach()
+    loss_sum = torch.zeros_like(loss_) if loss_sum is None else loss_sum
+    loss_sum += loss_
+    if step_ % (steps_per_print * gas) == 0:
+        opt_step = step_ / gas
+        avg_loss = loss_sum / gas
+        print_rank_0(
+            f"[{datetime.now()}] epoch: {epoch} | step: {int(opt_step)} | avg_loss: {avg_loss}",
+            rank)
+    if step_ % gas == 0:
+        loss_sum.zero_()
+
+    return loss_sum

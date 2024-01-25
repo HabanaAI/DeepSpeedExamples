@@ -1,3 +1,4 @@
+# Copyright (c) 2023 Habana Labs, Ltd. an Intel Company
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -42,17 +43,19 @@ def causal_lm_model_to_fp32_loss(model):
         return_dict=None,
         **deprecated_arguments,
     ):
+        kwargs = dict() if model.config.model_type == "llama" else dict(
+            head_mask=head_mask)
         output = model.__original_forward__(
             input_ids=input_ids,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
-            head_mask=head_mask,
             inputs_embeds=inputs_embeds,
             labels=None,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict)
+            return_dict=return_dict,
+            **kwargs)
 
         return_dict = isinstance(output, dict)
         lm_logits = output.logits if return_dict else output[0]
@@ -107,9 +110,12 @@ def create_hf_model(model_class,
 
     model.config.end_token_id = tokenizer.eos_token_id
     model.config.pad_token_id = model.config.eos_token_id
-    model.resize_token_embeddings(int(
-        8 *
-        math.ceil(len(tokenizer) / 8.0)))  # make the vocab size multiple of 8
+    # TODO SW-166764: The below fixes an issue with transformers resize_token_embeddings which set vocab_size
+    # according to the module.param shape, but in zero3 outside the gatheredParam context the
+    # storage is lost, and shape is zero.
+    new_token_emb_size = int(8 * math.ceil(len(tokenizer) / 8.0))
+    model.resize_token_embeddings(new_token_emb_size)  # make the vocab size multiple of 8
+    model.config.vocab_size = new_token_emb_size
 
     return model
 
@@ -121,24 +127,33 @@ def create_critic_model(model_name_or_path,
                         rlhf_training=False,
                         dropout=None,
                         zero_stage=0,
-                        compute_fp32_loss=False):
+                        compute_fp32_loss=False,
+                        optimized_reward_loss_calc=False,
+                        seed=0):
     # OPT model family always put a padding token at the beginning of the sequence,
     # we did not see this in other models but not sure if it is a general rule
 
     import time
 
     start = time.time()
+
     critic_model = create_hf_model(AutoModel, model_name_or_path, tokenizer,
                                    ds_config, rlhf_training, dropout)
     end = time.time()
     print_rank_0(f">Creating model from_config took {end - start} seconds",
                  None)
 
+    rng_state = torch.get_rng_state()
+    torch.manual_seed(seed)
+
     critic_model = RewardModel(
         critic_model,
         tokenizer,
         num_padding_at_beginning=num_padding_at_beginning,
-        compute_fp32_loss=compute_fp32_loss)
+        compute_fp32_loss=compute_fp32_loss,
+        opt_loss_calc=optimized_reward_loss_calc)
+
+    torch.set_rng_state(rng_state)
 
     if rlhf_training:
         # load critic model from checkpoint

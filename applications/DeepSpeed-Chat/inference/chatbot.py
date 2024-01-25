@@ -1,3 +1,4 @@
+# Copyright (c) 2023 Habana Labs, Ltd. an Intel Company
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -8,10 +9,15 @@ import re
 import logging
 import transformers  # noqa: F401
 import os
+import sys
 import json
 from transformers import pipeline, set_seed
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
+from deepspeed.accelerator import get_accelerator
 
+sys.path.insert(0,
+    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
+from training.utils.accelerator_utils import accelerator_model_preparation
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -54,7 +60,7 @@ def get_generator(path):
     generator = pipeline("text-generation",
                          model=model,
                          tokenizer=tokenizer,
-                         device="cuda:0")
+                         device=get_accelerator().device_name(0))
     return generator
 
 
@@ -72,7 +78,8 @@ def get_model_response(generator, user_input, max_new_tokens):
 
 def process_response(response, num_rounds):
     output = str(response[0]["generated_text"])
-    output = output.replace("<|endoftext|></s>", "")
+    if "<|endoftext|>" in output:
+        output = output.split("<|endoftext|>")[0]
     all_positions = [m.start() for m in re.finditer("Human: ", output)]
     place_of_second_q = -1
     if len(all_positions) > num_rounds:
@@ -83,6 +90,7 @@ def process_response(response, num_rounds):
 
 
 def main(args):
+    accelerator_model_preparation()
     generator = get_generator(args.path)
     set_seed(42)
 

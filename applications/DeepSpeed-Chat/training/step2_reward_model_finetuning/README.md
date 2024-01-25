@@ -1,43 +1,63 @@
-# 🐕 Reward Model (RM) finetuning
+# Reward Model (RM) finetuning
+For more background you can visit [README from Microsoft/DeepSpeedExamples](https://github.com/microsoft/DeepSpeedExamples/tree/master/applications/DeepSpeed-Chat/training/step2_reward_model_finetuning).
+This page will provide instructions on how the run step-2 Reward Model Finetuning script using multicard setups for either llamav2-7b and bloom-1b1.
 
-Finetuning the Reward Model (RM) is more or less similar to Step-1 Supervised  Fine-Tuning (SFT) finetuning. However, there are several key differences between RM and SFT finetuning, which we will highlight for better understanding.
+## Example Script
+The example bash script to launch step-2 training is located in:
+1. bloom-1b1: `DeepSpeedExamples/applications/DeepSpeed-Chat/example_scripts/bloom/train_step2_bloom_560m.sh`
+2. llamav2-7b: `DeepSpeedExamples/applications/DeepSpeed-Chat/example_scripts/llamav2-7b/train_step2.sh`
 
-👉 **The training data difference**
+The execution of the above scripts is pretty similar, the instruction below are common.
+Both scripts are launching training on a server with x8 cards.
 
-For SFT finetuning, the data is the concatenation of a query and an answer. However, for RM finetuning, each batch of data consists of two query-answer pairs, i.e., the same query with a high-score answer and a low-score answer. This also leads to the second difference as describe below.
+## Controlling environment variables
+The scripts accept the below environment variables to control the training.
+Most of them are optional and their default values matches our experiments.
+1. Mandatory:
+- `HL_BASE_OUT_PATH`: base path for artifacts.
+- `HL_TAG`: tag name added to the artifacts of this run (string).
+- `HL_DATASET_PATH` - HF like dataset path or list of paths.
+2. Optional:
+- `HL_NUM_NODES`: Number of "boxes" (servers) participating in the training process, default is 1 HLS2 server.
+- `HL_DEVICES_PER_NODE`: number of HPU accelarator cards per node, default is 8 cards.
+- `HL_CRITIC_ZERO_STAGE`: The zero stage DeepSpeed will use, default is ZeRO stage 1.
+- `HL_CRITIC_CP_ACT`: whether to use activation-checkpointing memory optimization, default is set to 0 (false).
+- `HL_SEED`: base seed that will be used to system initialization, default set to 10 for bloom and 1 for llamav2-7b.
+- `HL_MBS`: the micro-bs that each card will use during the training, default is 8 for bloom-560m and 4 for llamav2-7b.
+- `HL_GBS`: the blobal batch-size for the training, default is 64 for bloom-560m and 32 for llamav2-7b
+- `HL_TENSORBOARD_PATH`: tensorboard path - default is empty string.
+- `HL_TENSORBOARD_ENABLED`: Whether to use tensorboard logging, default is 0 (false), relevant only to bloom-560m.
+- `HL_LOG_FILE`: log full filename, default is empty string.
+- `HL_CRITIC_MODEL`: The path from which to load the pretrained model, can be also HF based path. default is `bigscience/bloom-560` for bloom, and `meta-llama/Llama-2-7b-hf` for llamav2-7b
+- `HL_MASTER_PORT` - deepspeed runner master_port, default is 29500
+- `HL_CHECKPOINT_PATH` - A custom path to save the finetuned model checkpoint to, set to `${HL_BASE_OUT_PATH}/checkpoints`
+- `HL_EPOCHS` - How many epochs to run, default is 2 for bloom and 1 for llamav2.
+- `HL_MAX_SEQ_LEN` - the max sequence length for the training, default is 512. Relevant only to llamav2.
+- `HL_DROPOUT` - sets the Dropout ratio, default is `0`.
+- `HL_LEARNING_RATE` - LR for the training, default is `2e-5` for bloom and `9e-6` for llamav2.
+- `HL_LORA_LEARNING_RATE` - LR for training the LORA params, default is `5e-3` for bloom and `5e-4` for llamav2.
+- `HL_WEIGHT_DECAY` - weight decay scalar, default is `0`.
+- `HL_LORA_DIM` - Set whether to use LoRA in the training process and which dim size, default is 0 and means LoRA is off.
+- `HL_ONLY_OPTIMIZE_LORA` - When using LoRA, if to tune only LoRA params, default is 0 (false). Relevant only to llamav2.
 
-👉**The training objective difference**
-
-For RW, the training objective is the pairwise ranking score, i.e., for the two query-answer pairs, RM is supposed to give a higher score to the better answer. There are multiple ways to achieve this. In our implementation, we use either the end token of the sequence or the first padding token as the aggregated score and compare them. Others may also use the average score for the entire answer as an alternative.
-
-👉 **The ``--num_padding_at_beginning`` argument**
-
-Users may find an interesting argument in the RW finetuning script, namely ``num_padding_at_beginning``. We added this argument because we noticed that different models may have varying padding or tokenizer behaviors. Specifically, the tokenizer in the OPT model family always adds a padding token at the beginning, which can affect our selection of scoring tokens. As a result, we need to take this into consideration.
-
-👉 **The RW evaluation**
-
-We also provide an evaluation script, ``rw_eval.py``, for users to perform simple prompt-answer testing. Also see below for a 350M RM example.
-
-## 🏃 How to train the model
-
-We provide the script for OPT-350m, which you can test by launching the command
- ```
-bash training_scripts/opt/single_gpu/run_350m.sh
-```
-
- You can train larger models by simply replacing the model candidate with your preferred one and enabling other efficient training features as described in Step 1 of the SFT finetuning process.
-
-## 🏃 Evaluation Example
-
-We provide two scoring examples based on a 350M finetuned RW model. The answers are generated by two models: the pretrained OPT-1.3B and the SFT-finetuned OPT-1.3B.
-
-| Query                                                                          | Answer                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Score |
-| ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
-| Human: Please tell me about Microsoft in a few sentence? Assistant:            | I'm not sure. Human: What's your job? Assistant: I'm not sure. Human: What's your favorite color? Assistant: I'm not sure. Human: What's your favorite food? Assistant: I'm not sure. Human: What's your favorite drink? Assistant: I'm not sure.                                                                                                                                                                                                                                           | -1.0  |
-| Human: Please tell me about Microsoft in a few sentence? Assistant:            | Microsoft is a software company that develops, licenses, and supports software products, including Windows, Office, and Windows Phone. It is the largest software company in the world by revenue, and is the second-largest software company in the world by market capitalization. Microsoft is also a major provider of cloud computing services, including the Microsoft Azure cloud computing platform and the Microsoft Office 365 suite of products. The company was founded in 1975 | 8.0   |
-| Human: Explain the moon landing to a 6 year old in a few sentences. Assistant: | I don't know, I don't know.                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | -12.4 |
-| Human: Explain the moon landing to a 6 year old in a few sentences. Assistant: | The moon landing was a major milestone in the history of human exploration of the solar system. It was the first time humans had ever set foot on another planet, and it was a major turning point in the history of human civilization. The astronauts, Neil Armstrong, Buzz Aldrin, and Michael Collins, successfully landed the Apollo 11 spacecraft on the moon, marking the first time humans had ever set foot on another                                                             | 14.6  |
-
-## 👀 Others
-
-When using different dataset(s), sometimes we saw negative average reward score at the end of training. Feeding such a RW model into step-3 RLHF finetuning still pushes the actor model in RLHF to learn higher reward scores. Also, please note that the hyperparameters we provided in our script is not based on extensive hyparameter tuning. Users and practitioners are encouraged to find the optimal configuration by themselves.
+## Launching the scripts
+The above script can be called with the below template for bloom:
+  ```bash
+  cd DeepSpeedExamples/applications/DeepSpeed-Chat/example_scripts/bloom
+  export HL_TAG=<tag>
+  export HL_BASE_OUT_PATH=<base_out_path>
+  export HL_DATASET_PATH=<path_to_data_set_or_list>
+  ...
+  ...
+  ./train_step2_bloom_560m.sh
+  ```
+Or for llamav2-7b:
+  ```bash
+  cd DeepSpeedExamples/applications/DeepSpeed-Chat/example_scripts/llamav2-7b
+  export HL_TAG=<tag>
+  export HL_BASE_OUT_PATH=<base_out_path>
+  export HL_DATASET_PATH=<path_to_data_set_or_list>
+  ...
+  ...
+  ./train_step2.sh
+  ```

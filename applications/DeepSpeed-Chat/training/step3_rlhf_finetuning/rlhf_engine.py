@@ -1,3 +1,4 @@
+# Copyright (c) 2023 Habana Labs, Ltd. an Intel Company
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -7,12 +8,14 @@ import torch
 import deepspeed
 from deepspeed.ops.adam import FusedAdam
 from deepspeed.ops.adam import DeepSpeedCPUAdam
+from deepspeed.accelerator import get_accelerator
 from transformers import AutoModelForCausalLM, get_scheduler
 
 from utils.ds_utils import get_train_ds_config, get_eval_ds_config
 from utils.module.lora import convert_linear_layer_to_lora, only_optimize_lora_parameters, make_model_gradient_checkpointing_compatible
 from utils.model.model_utils import create_hf_model, create_critic_model
-from utils.utils import get_optimizer_grouped_parameters
+from utils.utils import get_optimizer_grouped_parameters, print_rank_0
+from utils.accelerator_utils import is_hpu
 """
 TODOs:
   * support HF models for critic (for debugging), must be a previously saved ckpt from step-2
@@ -78,7 +81,8 @@ class DeepSpeedRLHFEngine():
             enable_tensorboard=self.args.enable_tensorboard,
             enable_mixed_precision_lora=self.args.enable_mixed_precision_lora,
             tb_path=self.args.tensorboard_path,
-            tb_name="step3_actor")
+            tb_name="step3_actor",
+            zero_hpz_enabled=self.args.zero_hpz_enabled_actor)
         ds_config[
             'train_micro_batch_size_per_gpu'] = self.args.per_device_training_batch_size
         #TODO(jeff): we should probably set grad accumlation steps here as well for clarity
@@ -104,8 +108,18 @@ class DeepSpeedRLHFEngine():
                 actor_model = make_model_gradient_checkpointing_compatible(
                     actor_model)
 
+
         # Optimizer
-        AdamOptimizer = DeepSpeedCPUAdam if self.args.offload else FusedAdam
+        if self.args.offload:
+            AdamOptimizer = DeepSpeedCPUAdam
+        elif self.args.no_fused_kernels or is_hpu():
+            AdamOptimizer = torch.optim.AdamW
+        else:
+            AdamOptimizer = FusedAdam
+        print_rank_0(
+            f'Using {AdamOptimizer.__name__} optimizer for actor model',
+            self.args.global_rank)
+
         optim_params = get_optimizer_grouped_parameters(
             actor_model, self.args.actor_weight_decay,
             self.args.actor_lora_learning_rate)
@@ -196,7 +210,8 @@ class DeepSpeedRLHFEngine():
             stage=self.args.critic_zero_stage,
             enable_tensorboard=self.args.enable_tensorboard,
             tb_path=self.args.tensorboard_path,
-            tb_name="step3_critic")
+            tb_name="step3_critic",
+            zero_hpz_enabled=self.args.zero_hpz_enabled_critic)
         ds_config[
             'train_micro_batch_size_per_gpu'] = self.args.per_device_training_batch_size
         #TODO(jeff): we should probably set grad accumlation steps here as well for clarity
@@ -235,7 +250,17 @@ class DeepSpeedRLHFEngine():
                     critic_model)
 
         # Optimizer
-        AdamOptimizer = DeepSpeedCPUAdam if self.args.offload else FusedAdam
+        # TODO SW-147425: change the file to use HPEX optimizer instead of AdamW on hpu
+        if self.args.offload:
+            AdamOptimizer = DeepSpeedCPUAdam
+        elif self.args.no_fused_kernels or (is_hpu()):
+            AdamOptimizer = torch.optim.AdamW
+        else:
+            AdamOptimizer = FusedAdam
+        print_rank_0(
+            f'Using {AdamOptimizer.__name__} optimizer for critic model',
+            self.args.global_rank)
+
         optim_params = get_optimizer_grouped_parameters(
             critic_model, self.args.critic_weight_decay,
             self.args.critic_lora_learning_rate)

@@ -1,67 +1,62 @@
-# 🐕 Supervised finetuning (SFT)
-Supervised finetuning (SFT) is very similar to standard language model finetuning on casual language tasks (e.g., WikiText-103). The main difference is from the dataset resources, SFT will collect high-quality query-answer pairs to finetune the model for human-perferred generation.
+# Supervised finetuning (SFT)
+For more background you can visit also the [README from Microsoft/DeepSpeedExamples](https://github.com/microsoft/DeepSpeedExamples/blob/master/applications/DeepSpeed-Chat/training/step1_supervised_finetuning/README.md).
+This page will provide instructions on how the run step-1 Finetuning script using multicard setups for either llamav2-7b and bloom-1b1.
 
-## 🏃 How to train the model
-We provide multiple scripts for training on single GPUs (e.g., a single A6000-48G, V100-32G, A100-40G, etc.), single nodes (e.g., 8/16x V100-32G, 8 A100-40G/80G), and multiple nodes setting (e.g., 64x A100-80G), which can be found in the 'training_scripts' directory. For example, if you have a single A6000-48G, you can simply run the corresponding script.
+## Example Script
+The example bash script to launch step-1 training is located in:
+1. bloom-1b1: `DeepSpeedExamples/applications/DeepSpeed-Chat/example_scripts/bloom/train_step1_bloom_1.1b.sh`
+2. llamav2-7b: `DeepSpeedExamples/applications/DeepSpeed-Chat/example_scripts/llamav2-7b/train_step1.sh`
+The execution of the above scripts is pretty similar, the instruction below are common.
+Both scripts are launching training on a server with x8 cards.
 
-```bash
- training_scripts/opt/single_gpu/run_1.3b.sh
- ```
+## Controlling environment variables
+The scripts accept the below environment variables to control the training. 
+Most of them are optional and their default values matches our experiments.
+1. Mandatory:
+* `HL_BASE_OUT_PATH`: base path for artifacts.
+* `HL_TAG`: tag name added to the artifacts of this run (string).
+- `HL_DATASET_PATH` - HF like dataset path or list of paths.
+2. Optional:
+- `HL_NUM_NODES`: Number of "boxes" (servers) participating in the training process, default is 1 HLS2 server.
+- `HL_DEVICES_PER_NODE`: number of HPU accelarator cards per node, default is 8 cards.
+- `HL_ACTOR_ZERO_STAGE`: The zero stage DeepSpeed will use, default is ZeRO stage 1.
+- `HL_ACTOR_CP_ACT`: whether to use activation-checkpointing memory optimization, default is set to 0 (false).
+- `HL_SEED`: base seed that will be used to system initialization, default set to 10 for bloom and 1 for llamav2-7b.
+- `HL_MBS`: the micro-bs that each card will use during the training, default is 8.
+- `HL_GBS`: the blobal batch-size for the training, default is 128 for bloom-1b1 and 64 for llamav2-7b
+- `HL_TENSORBOARD_PATH`: tensorboard path - default is empty string.
+- `HL_TENSORBOARD_ENABLED`: Whether to use tensorboard logging, default is 0 (false), relevant only to bloom-1b1.
+- `HL_LOG_FILE`: log full filename, default is empty string.
+- `HL_ACTOR_MODEL`: The path from which to load the pretrained model, can be also HF based path. default is `bigscience/bloom-1b1` for bloom, and `meta-llama/Llama-2-7b-hf` for llamav2-7b
+- `HL_MASTER_PORT` - deepspeed runner master_port, default is 29500
+- `HL_CHECKPOINT_PATH` - A custom path to save the finetuned model checkpoint to, set to `${HL_BASE_OUT_PATH}/checkpoints`
+- `HL_EPOCHS` - How many epochs to run, default is 4.
+- `HL_MAX_SEQ_LEN` - the max sequence length for the training, default is 512. Relevant only to llamav2.
+- `HL_DROPOUT` - sets the Dropout ratio, default is `0.1`.
+- `HL_LEARNING_RATE` - LR for the training, default is `2e-5` for bloom and `9e-6` for llamav2.
+- `HL_LORA_LEARNING_RATE` - LR for training the LORA params, default is `2e-5` for bloom and `5e-4` for llamav2.
+- `HL_WEIGHT_DECAY` - weight decay scalar, default is `0` for bloom and `0.1` for llamav2.
+- `HL_LORA_DIM` - Set whether to use LoRA in the training process and which dim size, default is 0 and means LoRA is off.
+- `HL_ONLY_OPTIMIZE_LORA` - When using LoRA, if to tune only LoRA params, default is 0 (false). Relevant only to llamav2.
 
-to train a OPT-1.3b model. It is easy to extend our single-node script to multi-node system.
-
-## 🏃 How to evaluate the SFT checkpoint?
-Once you finish the training using above code, you may simply do
-```bash evaluation_scripts/run_prompt.sh```
-
-It asks users to provide the paths of two models: (a) the original pretrained model (i.e., --model_name_or_path_baseline facebook/opt-1.3b) and (b) the fine-tuned model (i.e., --model_name_or_path_finetune output/check_base). "prompt_eval.py" includes several prompts that can be updated according to your preference.
-
-## 💁 Models and Datasets
-Since there is no opensource checkpoint for GPT3, we utilized the Meta OPT family pretrained models (i.e., facebook/opt-1.3b). One may also use other pretrained models (such as GPT-Neo, Bloom etc). As for the dataset, we also used those open-sourced datasets from to the Huggingface Datasets, namely
-```text
-Dahoas/rm-static
-Dahoas/full-hh-rlhf
-Dahoas/synthetic-instruct-gptj-pairwise
-yitingxie/rlhf-reward-datasets
-openai/webgpt_comparisons stanfordnlp/SHP
-```
-
-Thanks to the DeepSpeed RLHF data abstraction and blending techniques, we are now able to combine multiple sources of data for training. However, it is important to note that different datasets may use different prompt words (e.g., *Dohas/rm-static* uses "Human:" for queries and "Assistant:" for answers). Therefore, users must align these prompts by themselves. In our example, we use the format from *Dohas/rm-static* consistently. Through our evaluation, we have found that incorporating diverse datasets can improve the quality of the model. Please refer to the next section for examples of different query-answer pairs.
-
-## ☀️ Prompt examples from OPT-1.3B and its SFT variants with different finetuning data
-Note that the following generation on use the default generation from the model.
-
-|         Promt         | Human: Please tell me about Microsoft in a few sentence? Assistant:                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| :-------------------: | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-|       Baseline       | I'm not sure.<br />Human: What's your job? Assistant: I'm not sure. <br />Human: What's your favorite color? Assistant: I'm not sure. <br />Human: What's your favorite food? Assistant: I'm not sure.<br /> Human: What's your favorite drink? Assistant: I'm not sure. <br />Human: What                                                                                                                                                                                                                               |
-| Finetune w/ 1 dataset | Microsoft is a company that makes software for computers and other devices.<br /> They also make a lot of hardware, like computers and phones.  They have a lot of different products, <br />and they're very popular. `<\|endoftext\|>`                                                                                                                                                                                                                                                                                 |
-|  Finetune w/4 datase  | Microsoft is a multinational technology company that develops, licenses, and supports software,<br /> hardware, and services.It is the world's largest software company, and the largest software company <br />in the world. Microsoft is headquartered in Redmond, Washington, and has offices around the world.<br /> It is the largest software company in the world by revenue, and the largest software company in the <br />world by market capitalization. Microsoft is also a major player in                   |
-| Finetune w/ 6 dataset | Microsoft is a software company that develops, licenses, and supports software products,<br />including Windows, Office, and Windows Phone. It is the largest software company in the world<br /> by revenue, and is the second-largest software company in the world by market capitalization. <br />Microsoft is also a major provider of cloud computing services, including the Microsoft Azure <br />cloud computing platform and the Microsoft Office 365 suite of products. The company was founded<br /> in 1975 |
-
-|         Promt         | **Human: Write a short poem about a wise frog. Assistant:**                                                                                                                                                                                                                                                                          |
-| :--------------------: | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-|        Baseline        | Write a short poem about a wise frog. Human: Write a short poem about a wise frog.<br />Assistant: Write a short poem about a wise frog. Human: Write a short poem about a wise frog. <br />Assistant: Write a short poem about a wise frog. Human: Write a short poem about a wise frog.                                                  |
-| Finetune w/ 1 datasets | I'm not sure what you mean by a "wise frog", but I can try to write a poem about a frog that's wise `<\|endoftext\|>`                                                                                                                                                                                                                      |
-| Finetune w/4 datasets | A wise frog lives in a pond.<br /> He's always there when you need him<br />He's always there when you need advice,<br />He's always there when you need a laugh,<br />He's always there when you need a hug,<br />He's always there when you need a friend,<br />He's always there when you need a laugh,<br />He's always there when you |
-| Finetune w/ 6 datasets | A wise frog lives in a pond. He has a big mouth and a big heart.<br />He's always there to help.   He's a good friend to all.   He's a wise frog.`<\|endoftext\|>`                                                                                                                                                                         |
-
-## ☀️ Some arguments explanation and the largest trainable model
-Most of the arguments used in the main.py file have clear explanations and are usually easy to follow if you have previous experience with finetuning decoder models. However, if you're not clear on any of them, please don't hesitate to reach out on GitHub issues. In this section, we provide some specific explanations of the arguments and their usage.
-
-| Args                                                     | Explanation                                                                              | Note                                                                                                                                                                                       |
-|----------------------------------------------------------|------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| --data_path                                              | Data used to finetune the model                                                          | You can specific multiple data resources to train the model, e.g.,   Dahoas/rm-static Dahoas/full-hh-rlhf                                                                                  |
-| --data_split                                        | Split the data for three-step training                                                   | Following InstructGPT, we provide capability of splitting datasets so that each partition is only used in one step. Setting it as "2,4,4" means that we use 20%, 40%, 40% for each step respectively. You can change it to "10,0,0" if you only do SFT or if you find it's fine/helpful to use overlapping data in different steps (which is possible). |
-| --sft_only_data_path                                     | Single-response data used to finetune the model                                          | For single-response data that will only be used in step 1, you shall put them as part of this arg instead of the above data_path arg. Datasets in this arg will not be splitted and fully used in step 1 only. |
-| --gradient_checkpoint                                    | Enable gradient checkpointing (also known as activation checkpointing)   for the model   | This can significantly reduce the training memory cost                                                                                                                                     |
-| --offload                                                | DeepSpeed specific feature. Offload the model to CPT/NVME for memory   saving            | This is able to train larger model with less memory consumption. But it   will slow down the training.                                                                                     |
-| --zero_stage                                             | DeepSpeed specific feature, which works for multiple-GPU systems                         | This can help partition the model/optimizer across multiple GPUs. Please   see [here](https://www.deepspeed.ai/tutorials/zero/)                                                            |
-| --lora_dim                                               | When it is larger than 0, LoRA will be enabled                                           | Usually, LoRA needs a larger learning rate for better convergence                                                                                                                                                                 |
-| --lora_module_name                                       | The scope to enable LoRA module.                                                         |                                                                                                                                                                                            |
-| --only_optimize_lora                                     | Freeze all othre paramters and only optimize LoRA-related prameters                      |                                                                                                                                                                                            |
-| --gradient_checkpoint,   --lora_dim, only_optimize_lora | When LoRA and Gradient Checkpointing are enabled. Only Optimize LoRA   cannot be enabled | If all three are enabled, it will affect the gradient flow (aka the   augo-grad system backend by PyTorch)                                                                                 |
-
-One important consideration for users is determining the maximum model size they can train using their current system. Here, we present a method for estimating this limit. Assuming that you do not use the offload feature and enable (i) zero stage 3 (if using multiple GPUs), (ii) gradient checkpoint, and (iii) LoRA, the approximate maximum model size (in billions of parameters) that you can train can be estimated as "Total GPU memory in GB divided by 3." For example, if you have a single A6000-48G GPU, you can probably train models up to 16 billion parameters. It is important to note that this is a rough estimation, and you should verify it by yourselves.
-
-## 👀  Others
-From InstructGPT work, it is recommended to train the model for overfitting (aka longer epochs) for better human-preferred answers. Through our exploration, we have found this to be particularly helpful for smaller model finetuning, such as OPT-1.3B. It's worth noting that the hyperparameters we have provided in our script have not undergone extensive tuning. As such, we encourage users and practitioners to find the optimal configuration by themselves. Additionally, our system can be easily extended to other languages, such as Chinese and Japanese. To demonstrate this, we have included two examples under the "training_scripts/other_language" directory.
+## Launching the scripts
+The above script can be called with the below template for bloom:
+  ```bash
+  cd DeepSpeedExamples/applications/DeepSpeed-Chat/example_scripts/bloom
+  export HL_TAG=<tag>
+  export HL_BASE_OUT_PATH=<base_out_path>
+  export HL_DATASET_PATH=<path_to_data_set_or_list>
+  ...
+  ...
+  ./train_step1_bloom_1.1b.sh
+  ```
+Or for llamav2-7b:
+  ```bash
+  cd DeepSpeedExamples/applications/DeepSpeed-Chat/example_scripts/llamav2-7b
+  export HL_TAG=<tag>
+  export HL_BASE_OUT_PATH=<base_out_path>
+  export HL_DATASET_PATH=<path_to_data_set_or_list>
+  ...
+  ...
+  ./train_step1.sh
+  ```

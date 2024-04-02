@@ -1,80 +1,73 @@
-# 🐕 Reinforcement Learning from human feedback (RLHF) finetuning
+# Reinforcement Learning from human feedback (RLHF) finetuning
+For more background you can visit [README from Microsoft/DeepSpeedExamples](https://github.com/microsoft/DeepSpeedExamples/tree/master/applications/DeepSpeed-Chat/training/step3_rlhf_finetuning).
+This page will provide instructions on how the run step-3 RLHF script using multicard setups for either llamav2 and bloom.
 
-<img src="../../assets/image/ppo_trainer.png" width="900"/>
+## Example Script
+The example bash script to launch step-3 training is located in:
+1. bloom-1b1\bloom-560m: `DeepSpeedExamples/applications/DeepSpeed-Chat/example_scripts/bloom/train_step3_bloom_1.1b_560m.sh`
+2. llamav2-7b: `DeepSpeedExamples/applications/DeepSpeed-Chat/example_scripts/llamav2-7b/train_step3.sh`
 
-There are two main challenges here:
+The execution of the above scripts is pretty similar, the instruction below are common.
+Both scripts are launching training on a server with x8 cards.
 
-* 😵 How to handle the large memory consumption used for multiple models?
-* 😵 How can one efficiently generate answers as it typically dominates the training cost in RLHF?
+## Controlling environment variables
+The scripts accept the below environment variables to control the training.
+Most of them are optional and their default values matches our experiments.
 
-Here, we will provide a brief answer to both questions.
+1. Mandatory:
+- `HL_TAG`: tag name added to the artifacts of this run (string).
+- `HL_BASE_OUT_PATH`: base path for artifacts.
+- `HL_ACTOR_MODEL_PATH`: path for actor model checkpoint from step1.
+- `HL_CRITIC_MODEL_PATH` - path for critic model checkpoint from step2.
+- `HL_DATASET_PATH` - HF like dataset path or list of paths.
+2. Optional:
+- `HL_NUM_NODES` - Number of "boxes" (servers) participating in the training process, default is `1`.
+- `HL_DEVICES_PER_NODE` - number of HPU cards per node, default is 8.
+- `HL_ACTOR_CP_ACT` - whether to use activation-checkpointing memory optimization for actor model, default is set to 0 (false).
+- `HL_CRITIC_CP_ACT` - whether to use activation-checkpointing memory optimization for critic model, default is set to 0 (false).
+- `HL_SEED` - base seed that will be used to system initialization, default set to 10 for bloom and 1 for llamav2.
+- `HL_MBS` - the micro-bs that each card will use during the training, default is 2 for bloom and 4 for llamav2.
+- `HL_GBS` - the global-bs will be used for training, defauls is 64 for bloom and 32 for llamav2.
+- `HL_TENSORBOARD_PATH` - tensorboard path - Optional, empty string for default.
+- `HL_LOG_FILE` - log full filename- Optional, empty string for default
+- `HL_MASTER_PORT` - deepspeed runner master_port - Optional, default is 29500
+- `HL_HYBRID_ENGINE` - whether to use DeepSpeed HybridEngine, default is 0 (false), as it is not fully validated.
+- `HL_ACTOR_LEARNING_RATE` - LR for actor model training, default is `1e-5` for bloom and `9e-6` for llamav2.
+- `HL_ACTOR_LEARNING_RATE` - LR for critic model training, default is `6e-6` for bloom and `9e-6` for llamav2.
+- `HL_ACTOR_WEIGHT_DECAY` - actor model weight decay factor, default is `0.1` for bloom and `0` for llamav2.
+- `HL_CRITIC_WEIGHT_DECAY` - critic model weight decay factor, default is `0.1` for bloom and `0` for llamav2.
+- `HL_ACTOR_DROPOUT` - actor model dropout rate, default is 0.
+- `HL_CRITIC_DROPOUT` - critic model dropout rate, default is 0.
+- `HL_LORA_ACTOR_LR` - LR for actor model LoRA parameterss training, default is `4e-4` for bloom and `5e-4` for llamav2.
+- `HL_LORA_CRITIC_LR` - LR for actor model LoRA parameterss training, default is `6e-4` for bloom and `5e-4` for llamav2.
+- `HL_ONLY_OPTIMIZE_LORA` - if set, will optimize only LoRA params, default is 0 (false) and relevant only to llamav2.
+- `HL_LORA_DIM` - Which LoRA dimension will take place, 0 means no LoRA. default is `0` for bloom and `64` for llamav2.
+- `HL_EPOCHS` - How many training epochs will be used, default is 1.
+- `HL_NUM_WARMUP_STEPS` - How mant warm-up steps will be used, default is 100.
+- `HL_PRINT_ANSWERS_INTERVAL` - Allows to print the generated answers during the training, default is 0 (no print).
 
-#### 🚀 **Memory management in DeepSpeed-RLHF**
-
-We have three key techniques to reduce the memory pressure for RLHF finetuning.
-
-- ☀️ First, thanks to DeepSpeed ZeRO optimization, we can partition both the model parameters and optimizers across the entire GPU system used for training. This has significantly reduced the memory consumption required for these models.
-- ☀️ Secondly, the reference model has the same size as the actor model in the PPO training loop, which requires a non-trivial amount of memory. However, this reference model is called only when we need the "old behavior probability". Therefore, the computational cost of the reference model is lower than that of the actor model. To reduce memory pressure, we offer a single model offload option that only offloads the reference model to CPU. We observed minimal throughput effects with the same training batch size between with and without offloading the reference model (to CPU). However, if the actor model is offloaded to CPU, the training slows down significantly.
-- ☀️ Third, the optimization states of the optimizer consume a large amount of training memory. To alleviate this issue, we implemented LoRA, which only updates a small portion of the parameters during training. As a result, the optimization states are much smaller compared to standard training.
-
-#### 🚀 **DeepSpeed Hybrid Engine**
-
-Training and inference typically use two different backends in most high-optimized systems, including DeepSpeed. The reason is that these two objectives are usually utilized in different scenarios - training is used for model updating, while inference is used for model deployment. However, this paradigm does not hold for RLHF finetuning. In RLHF finetuning, the actor model needs to generate an answer for each query at each step. Therefore, the standard training mode can be a bottleneck for RLHF finetuning, as it is not optimized for inference.
-
-Besides, as mentioned above, we are able to use ZeRO optimization to partition the model across different GPUs. During generation, if we have to gather the parameters across GPUs (or nodes) for each generation step, the communication cost will be very high, particularly for large models.
-
-To overcome both challenges, we are introducing the DeepSpeed Hybrid Engine (DeepSpeed-HE). This engine can automatically switch between the training engine and inference engine provided by DeepSpeed, allowing RLHF training to benefit from both optimizations. Additionally, DeepSpeed-HE can automatically change the ZeRO-3 training mode to Tensor Parallelism (also known as Model Parallelism) inference, eliminating the need for repeated parameter gathering and providing a highly effective inference experience. As a result, users can directly import Hugging Face models for training without having to modify them for tensor parallelism or pipeline parallelism training.
-
-## 🏃 How to train RLHF
-
-We provide multiple actor training scripts in the 'training_scripts' folder, all using a fixed OPT-350m reward model. However, users are encouraged to experiment with different reward model sizes based on their preferences. For example, if you have a single GPU and want to train an OPT-1.3B model, you can simply run the following bash script to initiate the training process.
-
-```bash
-training_scripts/opt/single_gpu/run_1.3b.sh
-```
-
-## 🎵 Some arguments explanation and largest model training on your own system
-
-We provide most of unique arguments used in DeepSpeed RLHF other than the previous two steps here.
-
-| Args                                                               | Explanation                                                                                  | Note                                                                                                                                                                     |
-| ------------------------------------------------------------------ | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| --unsupervised_dataset_name and --unsupervised_dataset_config_name | Huggingface datasets standard setting to collect the data, e.g., using Wikitext-103          | When both are provided, during each PPO training, we will also add the pretraining objective. Based on InstructGPT, this will enhance the model's benchmark performance. |
-| --unsup_coef                                                       | Used to balance RLHF/PPO loss and the unsupervised loss                                      |                                                                                                                                                                          |
-| --per_device_generation_batch_size and --per_device_training_batch_size     | The first one is the generation batch size and the second one is the PPO training batch size | Usually, the first one needs to be divisible by the second one.                                                                                                           |
-| --generation_batches                                         | Generated N batches then do PPO training                                                     | This setting is common in RL, i.e., we generate an experiment table then do RL training                                                                                  |
-| --ppo_epochs                                                       | For the generated experiments, how many PPO epochs we want to perform                        |                                                                                                                                                                          |
-| --max_prompt_seq_len and --max_answer_seq_len                      | The length of the query and the length of the answer                                         |                                                                                                                                                                          |
-| --enable_hybrid_engine                                             | Enable it to use DeepSpeed Hybrid Engine                                                     | This will significantly speedup your training                                                                                                                            |
-| --inference_tp_size                                                | The inference tensor parallelism size                                                        | Normally, do not exceed the size of a single node                                                                                                                        |
-| --release_inference_cache                                          | Release the memory reserved for sentence generation                                          | This will slow down the training a bit but perhaps increasing the training batch size.                                                                                   |
-| --unpin_actor_parameters                                           | Do not gather the actor parameter for generation                                             | This will significantly slow down the generation phase. Usually we do not recommand this option.                                                                         |
-| --offload_reference_model                                          | Only offload the reference model to CPU                                                      | This helps increase the batch size with neglible time cost                                                                                                               |
-| --enable_ema                                                       | Add another model to collect the expotential moving average of the actor model's weight      | According to InstructGPT, the EMA weight has better performance than actor model's final checkpoint                                                                      |
-
-Theoretically, the largest model you can train for this step is similar to the step-1 SFT finetuning if you enable
-
-* zero stage 3 (if you use multiple GPUs)
-* gradient checkpoint
-* LoRA
-* reference model offloading.
-
-However, in practice, this is not always the case, and we are still investigating the reasons behind it. For now, we suggest that users use "Total-GPU-Memory-in-GB / 6" as the upper parameter bound in billions for the sum of the actor model and critical model, for safety. Nevertheless, users are welcome to try the real limit.
-
-## 🏃  How to evaluate
-
-Users can either use the `prompt_eval.py` script from Step 1 of the SFT process to test the Q&A quality of the model, or they can use the proof-of-concept multi-round conversation API for evaluation purposes.
-
-## 🙋 Instablity of RLHF training and others
-
-RLHF is a relatively new field, and as expected, we have encountered some training instabilities during our exploration. We are sharing our findings here and actively working on solutions. We also welcome solutions from the community.
-
-We have found that it is very unstable to use different generation training batch sizes (`--per_device_generation_batch_size`) and PPO training batch sizes (`--per_device_training_batch_size`), more than one PPO training epoch (`--ppo_epochs`), or more than one generation batch (`--generation_batches 1`). These all point to the same problem: we are not able to update the actor model multiple times after generating experimental data. Therefore, in all of our successful runs, we have set `per_device_generation_batch_size=per_device_training_batch_size` and `ppo_epochs=generation_batches=1`. This is unexpected for a standard RL training pipeline, and we have tried different methods to overcome this, but all have failed. One of the most likely reasons for this instability is that we found the `log_probs` and `old_log_probs` used in the `actor_loss_fn` function can quickly diverge even within two consecutive iterations, which causes the corresponding `ratio` to be huge. Setting a strict upper bound can alleviate this problem, but it cannot fully resolve the convergence issue.
-
-We have also found that adding unsupervised training is not easy. We tried using the coefficient (`--unsup_coef=27.8`) provided by InstructGPT, but it caused instability in the RLHF training. According to InstructGPT, unsupervised training mainly affects the model quality on standard benchmarks instead of the RLHF performance. We did not put much effort into tuning this parameter.
-
-👀 **Others**
-
-It is currently unclear how to effectively evaluate RLHF-trained models and SFT models trained in the first step. Often, researchers and practitioners rely on annotators to provide scores or use powerful pre-trained models such as ChatGPT or GPT4 to assess quality. As there is currently no standard solution, we do not provide a metric for our fine-tuned model.
-
-Additionally, please note that the hyperparameters we provide in our script are not based on extensive hyperparameter tuning. Users and practitioners are encouraged to find the optimal configuration for themselves.
+## Launching the scripts
+The above script can be called with the below template for bloom:
+  ```bash
+  cd DeepSpeedExamples/applications/DeepSpeed-Chat/example_scripts/bloom
+  export HL_TAG=<tag>
+  export HL_BASE_OUT_PATH=<base_out_path>
+  export HL_ACTOR_MODEL_PATH=<act_model_path>
+  export HL_CRITIC_MODEL_PATH=<cri_model_path>
+  export HL_DATASET_PATH=<path_to_data_set_or_list>
+  ...
+  ...
+  ./train_step3_bloom_1.1b_560m.sh
+  ```
+Or for llamav2-7b:
+  ```bash
+  cd DeepSpeedExamples/applications/DeepSpeed-Chat/example_scripts/llamav2-7b
+  export HL_TAG=<tag>
+  export HL_BASE_OUT_PATH=<base_out_path>
+  export HL_ACTOR_MODEL_PATH=<act_model_path>
+  export HL_CRITIC_MODEL_PATH=<cri_model_path>
+  export HL_DATASET_PATH=<path_to_data_set_or_list>
+  ...
+  ...
+  ./train_step3.sh
+  ```

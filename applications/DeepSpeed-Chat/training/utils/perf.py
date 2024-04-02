@@ -1,3 +1,4 @@
+# Copyright (c) 2023 Habana Labs, Ltd. an Intel Company
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -14,7 +15,7 @@ def print_throughput(hf_model, args, e2e_time, rank=0):
 
         gpus_per_model = torch.distributed.get_world_size()
         seq_length = args.max_seq_len
-        batch_size = args.per_device_train_batch_size
+        batch_size = args.per_device_train_batch_size * gpus_per_model * args.gradient_accumulation_steps
         samples_per_second = batch_size / e2e_time
         checkpoint_activations_factor = 4 if args.gradient_checkpointing else 3
         if args.lora_dim > 0:

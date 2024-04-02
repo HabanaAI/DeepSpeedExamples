@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# Copyright (c) 2023 Habana Labs, Ltd. an Intel Company
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -7,6 +8,7 @@ import argparse
 import os
 import math
 import sys
+import time
 
 import torch
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
@@ -21,13 +23,17 @@ import deepspeed
 from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
 from deepspeed.accelerator import get_accelerator
 
-sys.path.append(
+sys.path.insert(0,
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 from utils.model.model_utils import create_critic_model
 from utils.data.data_utils import create_prompt_dataset, DataCollatorReward
-from utils.utils import print_rank_0, to_device, save_hf_format, set_random_seed, get_all_reduce_mean, get_optimizer_grouped_parameters, save_zero_three_model, load_hf_tokenizer
+from utils.utils import print_rank_0, to_device, save_hf_format, set_random_seed, get_all_reduce_mean, \
+                        get_optimizer_grouped_parameters, load_hf_tokenizer, \
+                        print_loss
+from utils.accelerator_utils import is_hpu, accelerator_model_preparation, hpu_mark_step
 from utils.ds_utils import get_train_ds_config
 from utils.module.lora import convert_linear_layer_to_lora, convert_lora_to_linear_layer, only_optimize_lora_parameters, make_model_gradient_checkpointing_compatible
+from utils.perf import print_throughput
 
 
 def parse_args():
@@ -201,6 +207,33 @@ def parse_args():
     parser.add_argument('--tensorboard_path',
                         type=str,
                         default="step2_tensorboard")
+    ## Tokenizer
+    parser.add_argument(
+        "--add_eot_token",
+        action='store_true',
+        help="Add <|endoftext|> as additional special token to tokenizer")
+    ## Print loss
+    parser.add_argument(
+        '--print_loss',
+        action='store_true',
+        help='Prints loss at deepspeed config steps_per_print interval.')
+    ## Debug
+    parser.add_argument('--no_fused_kernels',
+                        action='store_true',
+                        help='Do not use cuda fused kernels.')
+    ## UPH
+    parser.add_argument(
+        "--optimized_reward_loss_calc",
+        action='store_true',
+        help=
+        "Whether to use an optimized approach for RM loss calculation, or legacy flow"
+    )
+    ## enable HPZ
+    parser.add_argument('--zero_hpz_enabled',
+                        default=False,
+                        action="store_true",
+                        help='enable HPZ optimization')
+    ## DeepSpeed
     parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
 
@@ -208,14 +241,18 @@ def parse_args():
 
 
 def main():
+    if is_hpu():
+        import habana_frameworks.torch.core as htcore  # noqa: F401
+
     args = parse_args()
 
     if args.local_rank == -1:
         device = torch.device(get_accelerator().device_name())
     else:
-        get_accelerator().set_device(args.local_rank)
-        device = torch.device(get_accelerator().device_name(), args.local_rank)
-        # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
+        if is_hpu():
+            get_accelerator().set_device(args.local_rank)
+        device = torch.device(get_accelerator().device_name(args.local_rank))
+        # Initializes the distributed backend which will take care of synchronizing nodes/GPUs
         # torch.distributed.init_process_group(backend='nccl')
         deepspeed.init_distributed()
 
@@ -226,7 +263,8 @@ def main():
                                     stage=args.zero_stage,
                                     enable_tensorboard=args.enable_tensorboard,
                                     tb_path=args.tensorboard_path,
-                                    tb_name="step2_model")
+                                    tb_name="step2_model",
+                                    zero_hpz_enabled=args.zero_hpz_enabled)
     ds_config[
         'train_micro_batch_size_per_gpu'] = args.per_device_train_batch_size
     ds_config[
@@ -237,23 +275,53 @@ def main():
     set_random_seed(args.seed)
     torch.distributed.barrier()
 
+    accelerator_model_preparation()
+
     # load_hf_tokenizer will get the correct tokenizer and set padding tokens based on the model family
-    tokenizer = load_hf_tokenizer(args.model_name_or_path, fast_tokenizer=True)
-    rm_model = create_critic_model(args.model_name_or_path,
-                                   tokenizer,
-                                   ds_config,
-                                   args.num_padding_at_beginning,
-                                   dropout=args.dropout,
-                                   zero_stage=args.zero_stage,
-                                   compute_fp32_loss=args.compute_fp32_loss)
+    args.end_of_conversation_token = "<|endoftext|>"
+    additional_special_tokens = args.end_of_conversation_token if args.add_eot_token else None
+    tokenizer = load_hf_tokenizer(args.model_name_or_path,
+                                  fast_tokenizer=True,
+                                  add_special_tokens=additional_special_tokens)
+    rm_model = create_critic_model(
+        args.model_name_or_path,
+        tokenizer,
+        ds_config,
+        args.num_padding_at_beginning,
+        dropout=args.dropout,
+        zero_stage=args.zero_stage,
+        compute_fp32_loss=args.compute_fp32_loss,
+        optimized_reward_loss_calc=args.optimized_reward_loss_calc,
+                                   seed=args.seed)
+
+
+    # Model bigscience/bloom-560m has large variance at ln_f.weight parameter
+    # This makes bf16 finetuning hard.
+    # In general, since we are replacing the model head, it makes sense to reset
+    # the LN that precedes it.
+    force_optimize_params = []
+    if "bigscience/bloom-" in args.model_name_or_path:
+        zero_init_enabled = (args.zero_stage == 3)
+        params = [rm_model.rwtransformer.ln_f.weight, rm_model.rwtransformer.ln_f.bias]
+        with deepspeed.zero.GatheredParameters(params,
+                                               modifier_rank=0,
+                                               enabled=zero_init_enabled):
+            if deepspeed.comm.get_rank() == 0 or not zero_init_enabled:
+                torch.nn.init.ones_(rm_model.rwtransformer.ln_f.weight)
+                torch.nn.init.zeros_(rm_model.rwtransformer.ln_f.bias)
+        force_optimize_params.extend(
+            ['rwtransformer.ln_f.weight', 'rwtransformer.ln_f.bias'])
 
     if args.lora_dim > 0:
         rm_model = convert_linear_layer_to_lora(rm_model,
                                                 args.lora_module_name,
                                                 args.lora_dim)
         if args.only_optimize_lora:
-            rm_model = only_optimize_lora_parameters(rm_model)
+            force_optimize_params.append('v_head.weight')
+            rm_model = only_optimize_lora_parameters(rm_model,
+                                                     force_optimize_params)
             rm_model = make_model_gradient_checkpointing_compatible(rm_model)
+
 
     train_phase = 2
     train_dataset, eval_dataset = create_prompt_dataset(
@@ -296,6 +364,7 @@ def main():
             total_predictions += chosen.shape[0]
             chosen_scores += _outputs["chosen_mean_scores"].mean().float()
             rejected_scores += _outputs["rejected_mean_scores"].mean().float()
+            hpu_mark_step()
             if (_step + 1) == eval_iters:
                 break
         _acc = correct_predictions / total_predictions
@@ -313,7 +382,15 @@ def main():
     optimizer_grouped_parameters = get_optimizer_grouped_parameters(
         rm_model, args.weight_decay, args.lora_learning_rate)
 
-    AdamOptimizer = DeepSpeedCPUAdam if args.offload else FusedAdam
+    # TODO SW-146129: change the file to use HPEX optimizer instead of AdamW on hpu
+    if args.offload:
+        AdamOptimizer = DeepSpeedCPUAdam
+    elif args.no_fused_kernels or is_hpu():
+        AdamOptimizer = torch.optim.AdamW
+    else:
+        AdamOptimizer = FusedAdam
+    print_rank_0(f'Using {AdamOptimizer.__name__} optimizer', args.global_rank)
+
     optimizer = AdamOptimizer(optimizer_grouped_parameters,
                               lr=args.learning_rate,
                               betas=(0.9, 0.95))
@@ -358,14 +435,30 @@ def main():
             f"Beginning of Epoch {epoch+1}/{args.num_train_epochs}, Total Micro Batches {len(train_dataloader)}",
             args.global_rank)
         rm_model.train()
-        mean_loss = 0
+        mean_loss = None
+        loss_sum = None
+        start = time.time()
         for step, batch in enumerate(train_dataloader):
             batch = to_device(batch, device)
             outputs = rm_model(**batch, use_cache=False)
             loss = outputs["loss"]
             rm_model.backward(loss)
+            hpu_mark_step()
             rm_model.step()
-            mean_loss += loss.item()
+            hpu_mark_step()
+            steps_per_print = ds_config['steps_per_print']
+            gas = args.gradient_accumulation_steps
+            if (step + 1) % (steps_per_print * gas) == 0 and args.global_rank == 0:
+                end = time.time()
+                hf_model = rm_model.model if hasattr(rm_model,
+                                                  'model') else rm_model.module
+                print_throughput(hf_model, args, (end - start) / steps_per_print, args.global_rank)
+                start = time.time()
+            if args.print_loss:
+                loss_sum = print_loss(epoch, step, steps_per_print,
+                                      gas, loss,
+                                      loss_sum, args.global_rank)
+            mean_loss = loss if mean_loss is None else mean_loss + loss
             total_micro_steps += 1
             gas_boundary = (total_micro_steps %
                             args.gradient_accumulation_steps == 0)
@@ -383,7 +476,7 @@ def main():
                 rm_model.train()
 
         print_rank_0(
-            f"Epoch {epoch+1}/{args.num_train_epochs} with loss {mean_loss/(step+1)}",
+            f"Epoch {epoch+1}/{args.num_train_epochs} with loss {mean_loss.item()/(step+1)}",
             args.global_rank)
         # Evaluate reward_loss on the validation set.
         print_rank_0(
@@ -401,14 +494,7 @@ def main():
         print_rank_0('saving model ...', args.global_rank)
         rm_model = convert_lora_to_linear_layer(rm_model)
 
-        if args.global_rank == 0:
-            save_hf_format(rm_model, tokenizer, args)
-        if args.zero_stage == 3:
-            # for zero stage 3, each gpu only has a part of the model, so we need to save the model on each gpu by using DS-Engine
-            save_zero_three_model(rm_model,
-                                  args.global_rank,
-                                  args.output_dir,
-                                  zero_stage=args.zero_stage)
+        save_hf_format(rm_model,tokenizer, args, args.global_rank, args.zero_stage)
 
 
 if __name__ == "__main__":

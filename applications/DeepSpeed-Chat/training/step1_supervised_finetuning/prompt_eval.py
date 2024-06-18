@@ -1,3 +1,4 @@
+# Copyright (c) 2023 Habana Labs, Ltd. an Intel Company
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -11,7 +12,7 @@ import os
 from transformers import (
     AutoModelForCausalLM, )
 
-sys.path.append(
+sys.path.insert(0,
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 from utils.model.model_utils import create_hf_model
 from utils.utils import load_hf_tokenizer

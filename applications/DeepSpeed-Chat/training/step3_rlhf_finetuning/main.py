@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# Copyright (c) 2023 Habana Labs, Ltd. an Intel Company
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -38,20 +39,18 @@ from rlhf_engine import DeepSpeedRLHFEngine
 
 import sys
 
-sys.path.append(
+sys.path.insert(0,
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 from utils.data.data_utils import create_prompt_dataset, MiniDataset, DataCollatorRLHF, get_unsupervised_data
 from utils.utils import print_rank_0, to_device, save_hf_format, set_random_seed, get_all_reduce_mean, \
-    moving_average, save_zero_three_model, load_hf_tokenizer, ExponentialMovingAverage
+    moving_average, load_hf_tokenizer, ExponentialMovingAverage
 from utils.module.lora import convert_lora_to_linear_layer
 from utils.perf import print_throughput_step3
+from utils.accelerator_utils import is_hpu, accelerator_model_preparation
 from deepspeed.accelerator import get_accelerator
-
-writer = None
 
 
 def parse_args():
-    global writer
     parser = argparse.ArgumentParser(
         description="(Step 3) RLHF training arguments")
 
@@ -373,16 +372,29 @@ def parse_args():
         help=
         "Training non-overflow step at which to terminate training during testing."
     )
+    parser.add_argument('--no_fused_kernels',
+                        action='store_true',
+                        help='Do not use cuda fused kernels.')
 
+    ## HPU
+    parser.add_argument("--enable_hpu_graphs",
+                        default=False,
+                        action="store_true",
+                        help="Enable HPU graphs.")
+    ## enable HPZ for actor
+    parser.add_argument('--zero_hpz_enabled_actor',
+                        default=False,
+                        action="store_true",
+                        help='enable actor HPZ optimization')
+    ## enable HPZ for critic
+    parser.add_argument('--zero_hpz_enabled_critic',
+                        default=False,
+                        action="store_true",
+                        help='enable critic HPZ optimization')
+
+    ## DeepSpeed
     parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
-
-    if args.enable_tensorboard:
-        print(
-            f"Tensorboard logs going to: {args.tensorboard_path}/step3_tensorboard_logs"
-        )
-        writer = SummaryWriter(
-            f"{args.tensorboard_path}/step3_tensorboard_logs")
 
     # Validate settings
     if args.inference_tp_size > 1:
@@ -394,6 +406,9 @@ def parse_args():
         raise ValueError(
             "The combination of [actor_zero_stage==2, critic_zero_stage==2, enable_hybrid_engine=True, offload=True, lora=False] is currently unsupported due to training instability!"
         )
+
+    if is_hpu():
+        assert not args.enable_mixed_precision_lora, "HPU does not support --enable_mixed_precision_lora"
 
     return args
 
@@ -451,12 +466,23 @@ def main():
     if args.local_rank == -1:
         device = torch.device(get_accelerator().device_name())
     else:
-        get_accelerator().set_device(args.local_rank)
-        device = torch.device(get_accelerator().device_name(), args.local_rank)
-        # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
+        if not is_hpu():
+            get_accelerator().set_device(args.local_rank)
+        device = torch.device(get_accelerator().device_name(args.local_rank))
+        # Initializes the distributed backend which will take care of synchronizing nodes/GPUs
         deepspeed.init_distributed()
 
+    accelerator_model_preparation(args.inference_tp_size)
+
     args.global_rank = torch.distributed.get_rank()
+
+    writer = None
+    if args.enable_tensorboard and args.global_rank == 0:
+        print(
+            f"Tensorboard logs going to: {args.tensorboard_path}/step3_tensorboard_logs"
+        )
+        writer = SummaryWriter(
+            f"{args.tensorboard_path}/step3_tensorboard_logs")
 
     unsupervised_training_enabled = args.unsupervised_dataset_name and args.unsupervised_dataset_config_name
     if unsupervised_training_enabled:
@@ -596,8 +622,7 @@ def main():
                     "-------------------------------------------------------------------------------------",
                     args.global_rank)
 
-                if args.enable_tensorboard and torch.distributed.get_rank(
-                ) == 0:
+                if writer is not None:
                     writer.add_scalar('reward',
                                       average_reward / inner_iter,
                                       global_step=step)
@@ -637,40 +662,10 @@ def main():
             rlhf_engine.actor_ema = convert_lora_to_linear_layer(
                 rlhf_engine.actor_ema)
 
-        if torch.distributed.get_rank() == 0:
-            save_hf_format(rlhf_engine.actor,
-                           tokenizer,
-                           args,
-                           sub_folder='actor')
-            save_hf_format(rlhf_engine.critic,
-                           tokenizer,
-                           args,
-                           sub_folder='critic')
-            if args.enable_ema:
-                save_hf_format(rlhf_engine.actor_ema,
-                               tokenizer,
-                               args,
-                               sub_folder='actor_ema')
-
-        if args.actor_zero_stage == 3:
-            save_zero_three_model(rlhf_engine.actor,
-                                  global_rank=args.global_rank,
-                                  save_dir=os.path.join(
-                                      args.output_dir, 'actor'),
-                                  zero_stage=args.actor_zero_stage)
-            if args.enable_ema:
-                save_zero_three_model(rlhf_engine.actor_ema,
-                                      global_rank=args.global_rank,
-                                      save_dir=os.path.join(
-                                          args.output_dir, 'actor_ema'),
-                                      zero_stage=args.actor_zero_stage)
-        if args.critic_zero_stage == 3:
-            save_zero_three_model(rlhf_engine.critic,
-                                  global_rank=args.global_rank,
-                                  save_dir=os.path.join(
-                                      args.output_dir, 'critic'),
-                                  zero_stage=args.critic_zero_stage)
-
+        save_hf_format(rlhf_engine.actor,tokenizer, args, args.global_rank, args.actor_zero_stage, 'actor')
+        if args.enable_ema:
+            save_hf_format(rlhf_engine.actor_ema,tokenizer, args, args.global_rank, args.actor_zero_stage, 'actor_ema')
+        save_hf_format(rlhf_engine.critic, tokenizer, args, args.global_rank, args.critic_zero_stage, 'critic')
 
 if __name__ == "__main__":
     main()

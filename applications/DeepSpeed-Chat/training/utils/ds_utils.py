@@ -22,7 +22,8 @@ def get_train_ds_config(offload,
                         enable_tensorboard=False,
                         enable_mixed_precision_lora=False,
                         tb_path="",
-                        tb_name=""):
+                        tb_name="",
+                        zero_hpz_enabled=False):
 
     device = "cpu" if offload else "none"
     if dtype == "fp16":
@@ -42,11 +43,19 @@ def get_train_ds_config(offload,
         "stage3_param_persistence_threshold": 1e4,
         "stage3_max_live_parameters": 3e7,
         "stage3_prefetch_bucket_size": 3e7,
-        "memory_efficient_linear": False
+        "memory_efficient_linear": False,
+        "overlap_comm": False,
+        "reduce_scatter": False
     }
+
+    if stage == 1:
+        zero_opt_dict["contiguous_gradients"] = False
+
     if enable_mixed_precision_lora:
         zero_opt_dict["zero_quantized_nontrainable_weights"] = True
-        if dist.get_world_size() != get_accelerator().device_count():
+
+    if enable_mixed_precision_lora or (zero_hpz_enabled and stage == 3): # hpz only relevant to zero 3
+          if dist.get_world_size() != get_accelerator().device_count():
             zero_opt_dict["zero_hpz_partition_size"] = get_accelerator(
             ).device_count()
     return {
@@ -90,7 +99,9 @@ def get_eval_ds_config(offload, dtype, stage=0):
         "offload_param": {
             "device": device
         },
-        "memory_efficient_linear": False
+        "memory_efficient_linear": False,
+        "overlap_comm": False,
+        "reduce_scatter": False
     }
     return {
         "train_batch_size": GLOBAL_BATCH_SIZE,

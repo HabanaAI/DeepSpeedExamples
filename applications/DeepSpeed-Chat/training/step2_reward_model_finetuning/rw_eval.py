@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# Copyright (c) 2023 Habana Labs, Ltd. an Intel Company
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -9,7 +10,7 @@ import torch
 
 import sys
 
-sys.path.append(
+sys.path.insert(0,
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 from utils.model.model_utils import create_critic_model
 from utils.utils import to_device
